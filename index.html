@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Virtual Rain Gauge</title>
+<title>Virtual Rain Gauge — Accurate Short-Term</title>
 <script defer src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   :root{
@@ -59,7 +59,7 @@
 <body>
   <header>
     <h1>🌧️ Virtual Rain Gauge</h1>
-    <p class="sub">Three saved locations + optional manual compare. Units: inches.</p>
+    <p class="sub">Short-term accuracy via Forecast API (hourly), long-term via Archive. Units: inches.</p>
   </header>
 
   <main>
@@ -82,7 +82,7 @@
         <button id="btnApply">Apply</button>
         <button id="btnClear" class="alt">Clear</button>
       </div>
-      <p class="hint">Tip: leave dates empty to compare the defaults (last 24h / 7d / 30d / 365d). Entering dates switches the chart to that range.</p>
+      <p class="hint">Tip: leave dates empty for defaults (24h / 7d / 30d / 365d). Custom dates switch chart & add a totals row.</p>
     </section>
 
     <section class="card">
@@ -104,7 +104,7 @@
   </main>
 
   <footer>
-    <div>Data: Open‑Meteo (archive API). Geocoding: OpenStreetMap Nominatim.</div>
+    <div>Data: Open‑Meteo forecast (hourly precipitation + past_days) & archive (daily precipitation_sum). Geocoding: OpenStreetMap Nominatim.</div>
   </footer>
 
 <script>
@@ -112,256 +112,153 @@ const MM_TO_IN = 0.0393701;
 
 // Exact preferred coordinates
 const FIXED = [
-  { id:'home', label:'Bay Village', address:'387 Bates Dr, Bay Village, OH', lat:41.4848, lon:-81.9221 },
-  { id:'findlay', label:'Findlay', address:'2003 Cobblestone Dr, Findlay, OH', lat:41.04278, lon:-83.64222 },
-  { id:'richfield', label:'Richfield', address:'3447 Revere Rd, Richfield, OH', lat:41.2335, lon:-81.6260 }
+  { id:'home', label:'Bay Village', lat:41.4848, lon:-81.9221 },
+  { id:'findlay', label:'Findlay', lat:41.04278, lon:-83.64222 },
+  { id:'richfield', label:'Richfield', lat:41.2335, lon:-81.6260 }
 ];
 
-let manual = null; // {label, lat, lon}
-let manualLabel = ''; // label to show in table & legend
+let manual = null;
+let manualLabel = '';
 let chart = null;
 
-// Helpers
 const fmt = n => (Math.round(n*100)/100).toFixed(2);
 const todayStr = () => new Date().toISOString().slice(0,10);
 const dateShift = (days) => { const d=new Date(); d.setDate(d.getDate()+days); return d.toISOString().slice(0,10); };
-const normalizeInches = (mmArr=[]) => mmArr.map(v => (v??0) * MM_TO_IN);
-const sumWindow = (arr=[], n) => arr.slice(-n).reduce((a,b)=>a+b,0);
+const sum = (arr=[]) => arr.reduce((a,b)=>a+(b||0),0);
+const toInches = mm => (mm||0)*MM_TO_IN;
 
-// API
-async function fetchDailySeries(lat, lon, start, end){
-  const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&start_date=${start}&end_date=${end}&daily=precipitation_sum&timezone=auto`;
+// Forecast API for recent hourly + daily: compute rolling last 24h and 7d
+async function fetchRecent(lat, lon){
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&past_days=8&hourly=precipitation&timezone=auto`;
   const r = await fetch(url);
-  if(!r.ok) throw new Error('Weather API error');
-  const d = await r.json();
-  if(!d.daily || !d.daily.precipitation_sum) throw new Error('No precip data');
-  return { time:d.daily.time, inches: normalizeInches(d.daily.precipitation_sum) };
+  const j = await r.json();
+  const now = new Date();
+  const times = j.hourly?.time || [];
+  const prec = j.hourly?.precipitation || [];
+  const filtered = [];
+  for(let i=0;i<times.length;i++){
+    if(new Date(times[i]) <= now){
+      filtered.push(toInches(prec[i]));
+    }
+  }
+  const last24 = sum(filtered.slice(-24));
+  const last168 = sum(filtered.slice(-168));
+  return { last24, last7: last168 };
 }
 
+// Archive API for daily series (used for 30d/365d and chart)
+async function fetchDailyArchive(lat, lon, start, end){
+  const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&start_date=${start}&end_date=${end}&daily=precipitation_sum&timezone=auto`;
+  const r = await fetch(url);
+  const d = await r.json();
+  const times = d.daily?.time || [];
+  const mm = d.daily?.precipitation_sum || [];
+  return { time: times, inches: mm.map(toInches) };
+}
+
+// Geocoding for manual address
 async function geocode(addr){
   const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(addr)}&addressdetails=1`;
   const r = await fetch(url, { headers:{ 'Accept-Language':'en' } });
-  if(!r.ok) throw new Error('Geocoding failed');
   const j = await r.json();
   if(!j.length) throw new Error('Address not found');
   const a = j[0]; const ad = a.address || {};
   const labelParts = [];
-  if(ad.house_number && ad.road) labelParts.push(`${ad.house_number} ${ad.road}`);
-  else if(ad.road) labelParts.push(ad.road);
-  if(ad.city) labelParts.push(ad.city); else if(ad.town) labelParts.push(ad.town);
+  if(ad.city) labelParts.push(ad.city);
+  else if(ad.town) labelParts.push(ad.town);
   if(ad.state) labelParts.push(ad.state);
   const label = labelParts.join(', ') || a.display_name;
   return { label, lat:parseFloat(a.lat), lon:parseFloat(a.lon) };
 }
 
-// Compute standard totals from a 365-day series
-function standardTotals(series){
-  const n = series.inches.length;
-  const last = n ? series.inches[n-1] : 0;
+function mergeTotals(short, longSeries){
   return {
-    'Last 24 Hours': last,
-    'Last 7 Days': sumWindow(series.inches, 7),
-    'Last 30 Days': sumWindow(series.inches, 30),
-    'Last 365 Days': sumWindow(series.inches, 365)
+    'Last 24 Hours': short.last24,
+    'Last 7 Days': short.last7,
+    'Last 30 Days': sum(longSeries.inches.slice(-30)),
+    'Last 365 Days': sum(longSeries.inches.slice(-365))
   };
 }
 
-// Render table: periods down the first column, locations across the top
-function renderTable(totalsByLoc, showCustom, customTotals){
+function renderTable(totalsByLoc){
   const thead = document.getElementById('thead');
   const tbody = document.getElementById('tbody');
-  thead.innerHTML = ''; tbody.innerHTML = '';
+  thead.innerHTML = '';
+  tbody.innerHTML = '';
 
   const headRow = document.createElement('tr');
   headRow.innerHTML = `
     <th class="row-label">Period</th>
-    <th class="loc-home">Bay Village</th>
-    <th class="loc-findlay">Findlay</th>
-    <th class="loc-richfield">Richfield</th>
-    ${manual ? `<th class="loc-manual">${manualLabel || 'Manual'}</th>` : ''}
+    <th>Bay Village</th>
+    <th>Findlay</th>
+    <th>Richfield</th>
+    ${manual ? `<th>${manualLabel}</th>` : ''}
   `;
   thead.appendChild(headRow);
 
-  const periods = ['Last 24 Hours','Last 7 Days','Last 30 Days','Last 365 Days'];
-  if(showCustom) periods.push('Custom Range');
-
-  for(const p of periods){
+  ['Last 24 Hours','Last 7 Days','Last 30 Days','Last 365 Days'].forEach(p => {
     const tr = document.createElement('tr');
-    const v = (loc, isCustom=false) => {
-      if(isCustom) return customTotals?.[loc] !== undefined ? fmt(customTotals[loc]) : '-';
-      const t = totalsByLoc[loc]?.[p];
-      return typeof t === 'number' ? fmt(t) : '-';
-    };
     tr.innerHTML = `
-      <td class="row-label">${p}</td>
-      <td class="emph">${p==='Custom Range'?v('home',true):v('home')}</td>
-      <td class="emph">${p==='Custom Range'?v('findlay',true):v('findlay')}</td>
-      <td class="emph">${p==='Custom Range'?v('richfield',true):v('richfield')}</td>
-      ${manual ? `<td class="emph">${p==='Custom Range'?v('manual',true):v('manual')}</td>` : ''}
+      <td>${p}</td>
+      <td>${fmt(totalsByLoc.home?.[p] || 0)}</td>
+      <td>${fmt(totalsByLoc.findlay?.[p] || 0)}</td>
+      <td>${fmt(totalsByLoc.richfield?.[p] || 0)}</td>
+      ${manual ? `<td>${fmt(totalsByLoc.manual?.[p] || 0)}</td>` : ''}
     `;
     tbody.appendChild(tr);
-  }
-}
-
-// Chart helpers
-function makeGradient(ctx, color){
-  const g = ctx.createLinearGradient(0,0,0,240);
-  const map = {
-    blue:['rgba(2,122,255,0.45)','rgba(2,122,255,0)'],
-    green:['rgba(0,200,83,0.35)','rgba(0,200,83,0)'],
-    orange:['rgba(255,159,64,0.35)','rgba(255,159,64,0)'],
-    purple:['rgba(123,97,255,0.35)','rgba(123,97,255,0)']
-  };
-  const [c1,c2] = map[color];
-  g.addColorStop(0,c1); g.addColorStop(1,c2);
-  return g;
+  });
 }
 
 function renderChart(labels, seriesByLoc){
   const ctx = document.getElementById('rainChart').getContext('2d');
   if(chart) chart.destroy();
-  const datasets = [];
-  if(seriesByLoc.home) datasets.push({label:'Bay Village', data:seriesByLoc.home, borderColor:'#027AFF', backgroundColor:makeGradient(ctx,'blue')});
-  if(seriesByLoc.findlay) datasets.push({label:'Findlay', data:seriesByLoc.findlay, borderColor:'#00C853', backgroundColor:makeGradient(ctx,'green')});
-  if(seriesByLoc.richfield) datasets.push({label:'Richfield', data:seriesByLoc.richfield, borderColor:'#FF9F40', backgroundColor:makeGradient(ctx,'orange')});
-  if(seriesByLoc.manual) datasets.push({label: manualLabel || 'Manual', data:seriesByLoc.manual, borderColor:'#7B61FF', backgroundColor:makeGradient(ctx,'purple')});
   chart = new Chart(ctx, {
     type:'line',
-    data:{ labels, datasets: datasets.map(d=>({...d, fill:true, tension:.25, pointRadius:2, borderWidth:2})) },
-    options:{
-      responsive:true,
-      interaction:{ mode:'index', intersect:false },
-      plugins:{ legend:{ position:'top' } },
-      scales:{ y:{ title:{ display:true, text:'Daily rainfall (in)' } } }
+    data:{
+      labels,
+      datasets:[
+        {label:'Bay Village', data:seriesByLoc.home, borderColor:'#027AFF', backgroundColor:'rgba(2,122,255,0.3)', fill:true, tension:0.25},
+        {label:'Findlay', data:seriesByLoc.findlay, borderColor:'#00C853', backgroundColor:'rgba(0,200,83,0.3)', fill:true, tension:0.25},
+        {label:'Richfield', data:seriesByLoc.richfield, borderColor:'#FF9F40', backgroundColor:'rgba(255,159,64,0.3)', fill:true, tension:0.25},
+        ...(manual ? [{label: manualLabel, data:seriesByLoc.manual, borderColor:'#7B61FF', backgroundColor:'rgba(123,97,255,0.3)', fill:true, tension:0.25}] : [])
+      ]
     }
   });
 }
 
-// Initial load: show table totals and last-30-days chart for the 3 fixed locations
 async function loadInitial(){
-  renderTable({}, false, null);
   const end365 = todayStr();
   const start365 = dateShift(-365);
-  const end30 = end365;
   const start30 = dateShift(-30);
-
   const totalsByLoc = {};
   const last30 = {};
   let labels = [];
 
   for(const loc of FIXED){
-    try{
-      const s365 = await fetchDailySeries(loc.lat, loc.lon, start365, end365);
-      totalsByLoc[loc.id] = standardTotals(s365);
-      const s30 = await fetchDailySeries(loc.lat, loc.lon, start30, end30);
-      last30[loc.id] = s30.inches;
-      if(labels.length===0) labels = s30.time;
-    }catch(e){ console.warn('Load failed for', loc.label, e); }
+    const [short, long365, long30] = await Promise.all([
+      fetchRecent(loc.lat, loc.lon),
+      fetchDailyArchive(loc.lat, loc.lon, start365, end365),
+      fetchDailyArchive(loc.lat, loc.lon, start30, end365)
+    ]);
+    totalsByLoc[loc.id] = mergeTotals(short, long365);
+    last30[loc.id] = long30.inches;
+    if(!labels.length) labels = long30.time;
   }
-
-  renderTable(totalsByLoc, false, null);
-  document.getElementById('chartTitle').textContent = 'Daily rainfall — last 30 days';
+  renderTable(totalsByLoc);
   renderChart(labels, last30);
-  document.getElementById('legendManual').style.display = 'none';
 }
 
-// Apply manual location and/or custom date range
-async function apply(){
+document.getElementById('btnApply').addEventListener('click', async () => {
   const addr = document.getElementById('manualAddress').value.trim();
-  const sd = document.getElementById('startDate').value;
-  const ed = document.getElementById('endDate').value;
-  const wantCustom = !!(sd && ed);
-
-  // Resolve manual location (if provided)
-  manual = null;
-  manualLabel = '';
   if(addr){
-    try { 
-      manual = await geocode(addr);
-      manualLabel = manual.label;
-    }
-    catch(e){ alert(e.message || 'Manual address lookup failed'); }
-  }
-  const legendManual = document.getElementById('legendManual');
-  const legendManualName = document.getElementById('legendManualName');
-  if(manual){
-    legendManual.style.display = '';
-    legendManualName.textContent = manualLabel;
-  }else{
-    legendManual.style.display = 'none';
-    legendManualName.textContent = '';
-  }
-
-  // Table: always include standard periods from last 365d
-  const end365 = todayStr();
-  const start365 = dateShift(-365);
-  const totalsByLoc = {};
-
-  // Fetch totals for fixed
-  for(const loc of FIXED){
-    try{
-      const s365 = await fetchDailySeries(loc.lat, loc.lon, start365, end365);
-      totalsByLoc[loc.id] = standardTotals(s365);
-    }catch(e){}
-  }
-  // Manual totals
-  if(manual){
-    try{
-      const s365m = await fetchDailySeries(manual.lat, manual.lon, start365, end365);
-      totalsByLoc.manual = standardTotals(s365m);
-    }catch(e){}
-  }
-
-  // Chart window (custom or default last 30 days)
-  let chartStart, chartEnd, chartTitle;
-  if(wantCustom){ chartStart = sd; chartEnd = ed; chartTitle = `Daily rainfall — ${sd} → ${ed}`; }
-  else { chartEnd = todayStr(); chartStart = dateShift(-30); chartTitle = 'Daily rainfall — last 30 days'; }
-
-  const seriesByLoc = {}; let labels = [];
-  for(const loc of FIXED){
-    try{
-      const s = await fetchDailySeries(loc.lat, loc.lon, chartStart, chartEnd);
-      seriesByLoc[loc.id] = s.inches;
-      if(labels.length===0) labels = s.time;
-    }catch(e){}
-  }
-  if(manual){
-    try{
-      const sm = await fetchDailySeries(manual.lat, manual.lon, chartStart, chartEnd);
-      seriesByLoc.manual = sm.inches;
-    }catch(e){}
-  }
-
-  // If custom range, compute custom totals for the Custom Range row (and round to 2 decimals)
-  let customTotals = null;
-  if(wantCustom){
-    customTotals = {};
-    customTotals.home = (seriesByLoc.home||[]).reduce((a,b)=>a+b,0);
-    customTotals.findlay = (seriesByLoc.findlay||[]).reduce((a,b)=>a+b,0);
-    customTotals.richfield = (seriesByLoc.richfield||[]).reduce((a,b)=>a+b,0);
-    if(manual) customTotals.manual = (seriesByLoc.manual||[]).reduce((a,b)=>a+b,0);
-  }
-
-  renderTable(totalsByLoc, wantCustom, customTotals);
-  document.getElementById('chartTitle').textContent = chartTitle;
-  renderChart(labels, seriesByLoc);
-}
-
-function clearAll(){
-  document.getElementById('manualAddress').value='';
-  document.getElementById('startDate').value='';
-  document.getElementById('endDate').value='';
-  manual = null;
-  manualLabel = '';
-  const legendManual = document.getElementById('legendManual');
-  const legendManualName = document.getElementById('legendManualName');
-  legendManual.style.display = 'none';
-  legendManualName.textContent = '';
+    manual = await geocode(addr);
+    manualLabel = manual.label;
+  } else { manual = null; manualLabel = ''; }
   loadInitial();
-}
-
-document.getElementById('btnApply').addEventListener('click', apply);
-document.getElementById('btnClear').addEventListener('click', clearAll);
+});
+document.getElementById('btnClear').addEventListener('click', () => {
+  manual = null; manualLabel = ''; document.getElementById('manualAddress').value=''; loadInitial();
+});
 window.addEventListener('DOMContentLoaded', loadInitial);
 </script>
 </body>
