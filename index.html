@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Virtual Rain Gauge — Accurate Short-Term</title>
+<title>Virtual Rain Gauge — Dual API v2</title>
 <script defer src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   :root{
@@ -31,50 +31,36 @@
   button.alt{background:#10b981}
   button:active{transform:translateY(1px)}
   .hint{margin:.5rem 2px 0;color:var(--muted);font-size:.85rem}
-
   .table-wrap{overflow:auto}
   table{width:100%;min-width:760px;border-collapse:collapse}
   th,td{padding:10px 8px;text-align:center;border-bottom:1px solid #eef2f7}
-  th{background:#f9fbff;color:#0b2545;font-weight:800;position:sticky;top:0}
+  th{background:#e9eff7;color:#0b2545;font-weight:800;position:sticky;top:0}
   .row-label{font-weight:700;text-align:left;padding-left:10px;color:#0b2545;width:180px}
-  th.loc-home{background:linear-gradient(90deg,rgba(2,122,255,.08),transparent)}
-  th.loc-findlay{background:linear-gradient(90deg,rgba(0,200,83,.08),transparent)}
-  th.loc-richfield{background:linear-gradient(90deg,rgba(255,159,64,.12),transparent)}
-  th.loc-manual{background:linear-gradient(90deg,rgba(123,97,255,.12),transparent)}
-  td.emph{font-weight:700}
-
   .chart-card{padding:10px 12px}
   .chart-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin:6px 2px 10px}
   .chart-head h2{margin:0;font-size:1rem;color:#0b3b69}
   .legend-note{color:var(--muted);font-size:.85rem}
-
   footer{padding:18px 12px 28px;text-align:center;color:var(--muted);font-size:.85rem}
-
-  @media (min-width:640px){
-    .inputs .grid{grid-template-columns:2fr 1fr 1fr}
-    header h1{font-size:1.4rem}
-  }
 </style>
 </head>
 <body>
   <header>
     <h1>🌧️ Virtual Rain Gauge</h1>
-    <p class="sub">Short-term accuracy via Forecast API (hourly), long-term via Archive. Units: inches.</p>
+    <p class="sub">Accurate short-term via Forecast API, long-term via Archive API. Units: inches.</p>
   </header>
-
   <main>
     <section class="card inputs">
       <div class="grid">
         <div>
           <label for="manualAddress">Manual location (optional)</label>
-          <input id="manualAddress" type="text" placeholder="e.g., 123 Main St, City, ST" />
+          <input id="manualAddress" type="text" placeholder="e.g., City, State" />
         </div>
         <div>
-          <label for="startDate">Custom range (start)</label>
+          <label for="startDate">Custom range start</label>
           <input id="startDate" type="date" />
         </div>
         <div>
-          <label for="endDate">Custom range (end)</label>
+          <label for="endDate">Custom range end</label>
           <input id="endDate" type="date" />
         </div>
       </div>
@@ -82,59 +68,50 @@
         <button id="btnApply">Apply</button>
         <button id="btnClear" class="alt">Clear</button>
       </div>
-      <p class="hint">Tip: leave dates empty for defaults (24h / 7d / 30d / 365d). Custom dates switch chart & add a totals row.</p>
+      <p class="hint">Leave dates empty for default 24h/7d/30d/365d view.</p>
     </section>
-
     <section class="card">
       <div class="table-wrap">
-        <table id="summaryTable" aria-live="polite">
+        <table id="summaryTable">
           <thead id="thead"></thead>
           <tbody id="tbody"></tbody>
         </table>
       </div>
     </section>
-
     <section class="card chart-card">
       <div class="chart-head">
         <h2 id="chartTitle">Daily rainfall — last 30 days</h2>
-        <div class="legend-note">Comparing Bay Village, Findlay, Richfield<span id="legendManual" style="display:none;">, <span id="legendManualName"></span></span></div>
+        <div class="legend-note" id="legendNote"></div>
       </div>
-      <canvas id="rainChart" aria-label="Rainfall comparison chart" role="img"></canvas>
+      <canvas id="rainChart"></canvas>
     </section>
   </main>
-
   <footer>
-    <div>Data: Open‑Meteo forecast (hourly precipitation + past_days) & archive (daily precipitation_sum). Geocoding: OpenStreetMap Nominatim.</div>
+    Data: Open‑Meteo APIs & OpenStreetMap Nominatim
   </footer>
-
 <script>
 const MM_TO_IN = 0.0393701;
-
-// Exact preferred coordinates
 const FIXED = [
   { id:'home', label:'Bay Village', lat:41.4848, lon:-81.9221 },
   { id:'findlay', label:'Findlay', lat:41.04278, lon:-83.64222 },
   { id:'richfield', label:'Richfield', lat:41.2335, lon:-81.6260 }
 ];
-
 let manual = null;
 let manualLabel = '';
 let chart = null;
-
+let customTotals = null;
 const fmt = n => (Math.round(n*100)/100).toFixed(2);
 const todayStr = () => new Date().toISOString().slice(0,10);
-const dateShift = (days) => { const d=new Date(); d.setDate(d.getDate()+days); return d.toISOString().slice(0,10); };
-const sum = (arr=[]) => arr.reduce((a,b)=>a+(b||0),0);
+const dateShift = days => { const d=new Date(); d.setDate(d.getDate()+days); return d.toISOString().slice(0,10); };
+const sum = arr => arr.reduce((a,b)=>a+(b||0),0);
 const toInches = mm => (mm||0)*MM_TO_IN;
-
-// Forecast API for recent hourly + daily: compute rolling last 24h and 7d
 async function fetchRecent(lat, lon){
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&past_days=8&hourly=precipitation&timezone=auto`;
   const r = await fetch(url);
   const j = await r.json();
-  const now = new Date();
   const times = j.hourly?.time || [];
   const prec = j.hourly?.precipitation || [];
+  const now = new Date();
   const filtered = [];
   for(let i=0;i<times.length;i++){
     if(new Date(times[i]) <= now){
@@ -145,8 +122,6 @@ async function fetchRecent(lat, lon){
   const last168 = sum(filtered.slice(-168));
   return { last24, last7: last168 };
 }
-
-// Archive API for daily series (used for 30d/365d and chart)
 async function fetchDailyArchive(lat, lon, start, end){
   const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&start_date=${start}&end_date=${end}&daily=precipitation_sum&timezone=auto`;
   const r = await fetch(url);
@@ -155,14 +130,13 @@ async function fetchDailyArchive(lat, lon, start, end){
   const mm = d.daily?.precipitation_sum || [];
   return { time: times, inches: mm.map(toInches) };
 }
-
-// Geocoding for manual address
 async function geocode(addr){
   const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(addr)}&addressdetails=1`;
-  const r = await fetch(url, { headers:{ 'Accept-Language':'en' } });
+  const r = await fetch(url);
   const j = await r.json();
   if(!j.length) throw new Error('Address not found');
-  const a = j[0]; const ad = a.address || {};
+  const a = j[0];
+  const ad = a.address || {};
   const labelParts = [];
   if(ad.city) labelParts.push(ad.city);
   else if(ad.town) labelParts.push(ad.town);
@@ -170,7 +144,6 @@ async function geocode(addr){
   const label = labelParts.join(', ') || a.display_name;
   return { label, lat:parseFloat(a.lat), lon:parseFloat(a.lon) };
 }
-
 function mergeTotals(short, longSeries){
   return {
     'Last 24 Hours': short.last24,
@@ -179,37 +152,38 @@ function mergeTotals(short, longSeries){
     'Last 365 Days': sum(longSeries.inches.slice(-365))
   };
 }
-
-function renderTable(totalsByLoc){
+function renderTable(totalsByLoc, customTotals){
   const thead = document.getElementById('thead');
   const tbody = document.getElementById('tbody');
   thead.innerHTML = '';
   tbody.innerHTML = '';
-
   const headRow = document.createElement('tr');
-  headRow.innerHTML = `
-    <th class="row-label">Period</th>
-    <th>Bay Village</th>
-    <th>Findlay</th>
-    <th>Richfield</th>
-    ${manual ? `<th>${manualLabel}</th>` : ''}
-  `;
+  headRow.innerHTML = `<th class="row-label">Period</th>` +
+    `<th>Bay Village</th>` +
+    `<th>Findlay</th>` +
+    `<th>Richfield</th>` +
+    (manual ? `<th>${manualLabel}</th>` : '');
   thead.appendChild(headRow);
-
   ['Last 24 Hours','Last 7 Days','Last 30 Days','Last 365 Days'].forEach(p => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${p}</td>
-      <td>${fmt(totalsByLoc.home?.[p] || 0)}</td>
-      <td>${fmt(totalsByLoc.findlay?.[p] || 0)}</td>
-      <td>${fmt(totalsByLoc.richfield?.[p] || 0)}</td>
-      ${manual ? `<td>${fmt(totalsByLoc.manual?.[p] || 0)}</td>` : ''}
-    `;
+    tr.innerHTML = `<td>${p}</td>` +
+      `<td>${fmt(totalsByLoc.home?.[p] || 0)}</td>` +
+      `<td>${fmt(totalsByLoc.findlay?.[p] || 0)}</td>` +
+      `<td>${fmt(totalsByLoc.richfield?.[p] || 0)}</td>` +
+      (manual ? `<td>${fmt(totalsByLoc.manual?.[p] || 0)}</td>` : '');
     tbody.appendChild(tr);
   });
+  if(customTotals){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>Custom Range</td>` +
+      `<td>${fmt(customTotals.home || 0)}</td>` +
+      `<td>${fmt(customTotals.findlay || 0)}</td>` +
+      `<td>${fmt(customTotals.richfield || 0)}</td>` +
+      (manual ? `<td>${fmt(customTotals.manual || 0)}</td>` : '');
+    tbody.appendChild(tr);
+  }
 }
-
-function renderChart(labels, seriesByLoc){
+function renderChart(labels, seriesByLoc, title){
   const ctx = document.getElementById('rainChart').getContext('2d');
   if(chart) chart.destroy();
   chart = new Chart(ctx, {
@@ -224,42 +198,56 @@ function renderChart(labels, seriesByLoc){
       ]
     }
   });
+  document.getElementById('chartTitle').textContent = title;
 }
-
-async function loadInitial(){
+async function loadData(customStart=null, customEnd=null){
   const end365 = todayStr();
   const start365 = dateShift(-365);
   const start30 = dateShift(-30);
   const totalsByLoc = {};
-  const last30 = {};
+  const chartData = {};
   let labels = [];
-
-  for(const loc of FIXED){
-    const [short, long365, long30] = await Promise.all([
-      fetchRecent(loc.lat, loc.lon),
-      fetchDailyArchive(loc.lat, loc.lon, start365, end365),
-      fetchDailyArchive(loc.lat, loc.lon, start30, end365)
-    ]);
+  customTotals = null;
+  const locs = [...FIXED];
+  if(manual) locs.push({id:'manual', label: manualLabel, lat:manual.lat, lon:manual.lon});
+  for(const loc of locs){
+    const short = await fetchRecent(loc.lat, loc.lon);
+    const long365 = await fetchDailyArchive(loc.lat, loc.lon, start365, end365);
     totalsByLoc[loc.id] = mergeTotals(short, long365);
-    last30[loc.id] = long30.inches;
-    if(!labels.length) labels = long30.time;
+    if(customStart && customEnd){
+      const customSeries = await fetchDailyArchive(loc.lat, loc.lon, customStart, customEnd);
+      chartData[loc.id] = customSeries.inches;
+      if(!labels.length) labels = customSeries.time;
+      if(!customTotals) customTotals = {};
+      customTotals[loc.id] = sum(customSeries.inches);
+    } else {
+      const long30 = await fetchDailyArchive(loc.lat, loc.lon, start30, end365);
+      chartData[loc.id] = long30.inches;
+      if(!labels.length) labels = long30.time;
+    }
   }
-  renderTable(totalsByLoc);
-  renderChart(labels, last30);
+  renderTable(totalsByLoc, customTotals);
+  const title = customStart && customEnd ? `Daily rainfall — ${customStart} to ${customEnd}` : 'Daily rainfall — last 30 days';
+  renderChart(labels, chartData, title);
 }
-
 document.getElementById('btnApply').addEventListener('click', async () => {
   const addr = document.getElementById('manualAddress').value.trim();
+  const start = document.getElementById('startDate').value;
+  const end = document.getElementById('endDate').value;
   if(addr){
-    manual = await geocode(addr);
-    manualLabel = manual.label;
+    try{
+      manual = await geocode(addr);
+      manualLabel = manual.label;
+    }catch(e){ alert(e.message); return; }
   } else { manual = null; manualLabel = ''; }
-  loadInitial();
+  loadData(start || null, end || null);
 });
 document.getElementById('btnClear').addEventListener('click', () => {
-  manual = null; manualLabel = ''; document.getElementById('manualAddress').value=''; loadInitial();
+  manual = null; manualLabel = ''; document.getElementById('manualAddress').value='';
+  document.getElementById('startDate').value=''; document.getElementById('endDate').value='';
+  loadData();
 });
-window.addEventListener('DOMContentLoaded', loadInitial);
+window.addEventListener('DOMContentLoaded', () => loadData());
 </script>
 </body>
 </html>
